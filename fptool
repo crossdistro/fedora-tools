@@ -1,0 +1,255 @@
+#!/usr/bin/python3
+
+import os, sys, glob
+import functools
+import subprocess
+import argparse
+import pipes
+
+check_output = functools.partial(subprocess.check_output, universal_newlines=True)
+
+def warning(*args, **kargs):
+    print("[warning]", *args, file=sys.stderr, **kargs)
+
+def error(*args, **kargs):
+    print(file=sys.stderr)
+    print(*args, file=sys.stderr, **kargs)
+    print(file=sys.stderr)
+    if error:
+        sys.exit(1)
+
+class Application:
+    def __init__(self):
+        self._commit = []
+        self._rollback = []
+
+    def notice(self, *args, **kargs):
+        if self.options.verbose:
+            print("[notice]", *args, file=sys.stderr, **kargs);
+
+    def run(self, command, method=subprocess.check_call):
+        if self.options.verbose:
+            print("[run] command={}".format(command), file=sys.stderr)
+        return method(command, universal_newlines=True)
+
+    def plan(self, command, rollback=False):
+        command = [arg for arg in command if arg is not None]
+        self.notice("{} command: {}".format("rollback" if rollback else "transaction", command))
+        commands = self._rollback if rollback else self._commit
+        commands.append(command)
+
+    def commit(self):
+        if self.options.pretend:
+            self.notice("Plan not commited due to '--pretend' option.")
+            self.notice("Printing commands...")
+            print('--------------------')
+        else:
+            self.notice("Commiting plan...")
+
+        while self._commit:
+            command = self._commit[0]
+            if self.options.pretend:
+                print(" ".join(pipes.quote(arg) for arg in command))
+            else:
+                self.run(command)
+            del self._commit[0]
+
+        if self.options.pretend:
+            print('--------------------')
+            self.notice("Printing rollback commands...")
+            print('--------------------')
+            for command in self._rollback:
+                print(" ".join(pipes.quote(arg) for arg in command))
+            print('--------------------')
+
+        self.notice("Done.")
+
+    def rollback(self):
+        self.notice("Rolling back.")
+
+        self.notice("Couldn't finish the following commands:")
+        self.notice("-"*79)
+        for command in self._commit:
+            self.notice(" ".join(pipes.quote(arg) for arg in command))
+        self.notice("-"*79)
+
+        for command in self._rollback:
+            try:
+                self.run(command)
+            except subprocess.CalledProcessError:
+                pass
+
+    def main(self):
+        parser = argparse.ArgumentParser(description="Perform common fedora packaging tasks.")
+        parser.add_argument("--pretend", "-p", action="store_true", help="Do not perform any changes.")
+        parser.add_argument("--quiet", "-q", dest="verbose", action="store_false", help="Do not print notices")
+
+        parser.add_argument("--fedpkg", default="fedpkg", help="Path to fedpkg tool or an alternative.")
+
+        parser.add_argument("--packages", "--package", default="", help="Perform changes on packages.")
+        parser.add_argument("--master", "-m", action="store_true", help="Perform changes on the master branch.")
+        parser.add_argument("--branches", "--branch", default="", help="Perform changes on branches.")
+        parser.add_argument("--rhbug", help="Bugzilla bug identifier.")
+        parser.add_argument("--dist", help="Override '--dist' argument passed to 'fedpkg'.")
+
+        parser.add_argument("--private-branch", action="store_true", help="Check out a private branch.")
+        parser.add_argument("--bump", nargs='?', const='', help="Bump release and create changelog entry. Optionally also switch upstream version.")
+        parser.add_argument("--scratch-build", action="store_true", help="Perform a scratch build using a locally built source RPM.")
+        parser.add_argument("--commit", action="store_true", help="Create a commit.")
+        parser.add_argument("--merge", action="store_true", help="Merge commits from master to branches.")
+        parser.add_argument("--push", action="store_true", help="Push a commit.")
+        parser.add_argument("--build", action="store_true", help="Create a build.")
+        parser.add_argument("--update", action="store_true", help="Create an update.")
+        parser.add_argument("--stable", action="store_true", help="Request update stabilization.")
+        parser.add_argument("--stay", dest="switch_back", action="store_false", help="Don't switch back to master.")
+
+        # update types
+        parser.add_argument("--type", default="enhancement", help="Type of update (enhancement, bugfix, security).")
+        parser.add_argument("--comment", help="Bump or pdate comment.")
+
+        self.options = parser.parse_args()
+
+        # select package and enter its directory
+        self.orig_pwd = os.getcwd()
+        self.packages = [package.strip() for package in self.options.packages.split(",")]
+        self.packages = [package for package in self.packages if package]
+
+        print(self.packages)
+        if self.packages:
+            package = self.packages[0]
+            os.chdir(os.path.join(os.environ["HOME"], "fedora", package))
+
+        # check the environment and postprocess arguments
+        self.notice("Current directory: {!r}.".format(os.getcwd()))
+        specfiles = glob.glob("*.spec")
+        if len(specfiles) == 0:
+            error("Specfile not found.")
+        elif len(specfiles) == 1:
+            self.specfile = specfiles[0]
+            self.notice("Specfile found: {}".format(self.specfile))
+        else:
+            error("More than one specfiles found.")
+
+        # Usually only needed for packages that are not yet in Fedora
+        self.module_name = os.path.split(os.getcwd())[-1]
+
+        if not os.path.isdir(".git"):
+            self.notice("Git working directory not detected.")
+
+        self.orig_branch = self.run(['git', 'symbolic-ref', '--short', 'HEAD'], method=check_output).strip()
+
+        self.branches = [branch.strip() for branch in self.options.branches.split(",")]
+        self.branches = [branch for branch in self.branches if branch]
+
+        if not self.options.master and not self.branches:
+            error("You need to specify a branch using '--master' or '--branches'.")
+
+        # Plan commands on master branch
+        if self.options.master:
+            self.process_branch(None)
+
+        # Plan commands on branches
+        if self.branches:
+            for branch in self.branches:
+                self.process_branch(branch)
+        self.run(['git', 'checkout', self.orig_branch])
+
+        if self.options.switch_back:
+            self.plan(['git', 'checkout', self.orig_branch])
+            self.plan(['git', 'checkout', self.orig_branch], rollback=True)
+        try:
+            self.commit()
+        except:
+            self.rollback()
+        finally:
+            os.chdir(self.orig_pwd)
+
+    def pkg(self, command):
+        result = [self.options.fedpkg]
+        if self.module_name:
+            result.append('--module-name=' + self.module_name)
+        result += command
+        return result
+
+    def process_branch(self, branch):
+
+        # We used to use `fedpkg switch-branch` but it doesn't cope with
+        # situations that `git checkout` handles like a small change
+        # unintentionally performed on another branch.
+        self.plan(['git', 'checkout', branch or 'master'])
+
+        dist = self.options.dist or branch or 'master'
+
+        try:
+            verrel = self.run(self.pkg(["--dist="+dist, "verrel"]), method=check_output).strip()
+            self.notice("Package name and version reported by fedpkg is '{}'.".format(verrel))
+        except subprocess.CalledProcessError:
+            warning("Failed to run 'fedpkg verrel'. Make sure your working directory is a Fedora package directory and that you installed all necessary tools.")
+
+        if self.options.private_branch:
+            if not self.options.rhbug:
+                error("Cannot use '--private-branch' without '--rhbug'.")
+            private = "private-{}-rh{}".format(branch, self.options.rhbug)
+            if self.run(['git', 'show-ref', 'heads/'+private], method=subprocess.call) == 0:
+                error("Branch already exists. You can remove it using the following command.\n\n    git branch --delete --force {}".format(private))
+            self.plan(['git', 'checkout', branch], rollback=True)
+            self.plan(['git', 'branch', '--delete', '--force', private], rollback=True)
+            self.plan(['git', 'checkout', '-b', private])
+
+            # From now on we need to perform all actions on the private branch.
+            branch = private
+        if self.options.bump is not None:
+            args = ['rpmdev-bumpspec', self.specfile]
+            if self.options.bump:
+                args += ['--new', self.options.bump, '--comment', 'New version {}'.format(self.options.bump)]
+            elif self.options.private_branch:
+                args.append('--rightmost')
+                self.plan(['sed', '-r', '-i', 's/^(Release:[^%]*)(.rh{0})?%/\\1.rh{0}%/'.format(self.options.rhbug), self.specfile])
+
+            if self.options.comment:
+                args += ['--comment', self.options.comment]
+
+            self.plan(args)
+
+            # Use the newly written specfile to download sources
+            if self.options.bump:
+                self.commit()
+                lines = self.run(['spectool', '-l', self.specfile], method=subprocess.check_output).split('\n')
+                paths = [line.split('/')[-1] for line in lines if '/' in line]
+
+        if self.options.scratch_build:
+            self.plan(self.pkg(['--dist='+dist, 'build', '--scratch', '--srpm']))
+        if self.options.commit:
+            self.plan(self.pkg(['commit', '-c']))
+
+        if self.options.merge:
+            self.plan(['git', 'merge', '--ff-only', 'master'])
+        if self.options.push:
+            self.plan(['git', 'push', '--force', '--set-upstream', 'origin', branch])
+        if self.options.build:
+            self.plan(self.pkg(['build']))
+
+        if branch is not None:
+            if self.options.update:
+                default_comment = {
+                    'enhancement': "Enhancement update.",
+                    'bugfix': "Bug fix update.",
+                    'security': "Security update.",
+                }
+                self.plan([
+                    'bodhi',
+                    '--new',
+                    '--type={}'.format(self.options.type),
+                    '--bugs={}'.format(self.options.rhbug or ""),
+                    '--notes={}'.format(self.options.comment or default_comment[self.options.type]),
+                    '--close-bugs',
+                    verrel])
+            if self.options.stable:
+                self.plan([
+                    'bodhi',
+                    verrel,
+                    '--request',
+                    'stable'])
+
+if __name__ == '__main__':
+    Application().main()
