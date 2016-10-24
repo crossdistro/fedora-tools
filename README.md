@@ -1,4 +1,4 @@
-# fptool
+# Wrapper over Fedora package maintainance tools
 
 Note: The use cases below are untested. Use with care.
 
